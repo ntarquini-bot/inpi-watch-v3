@@ -27,7 +27,8 @@ jobs:
           python watch_inpi.py
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: reporte-inpi
-          path: out/
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: reporte-inpi
+    path: out/
