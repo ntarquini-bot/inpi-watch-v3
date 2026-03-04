@@ -14,17 +14,20 @@ import pdfplumber
 INPI_BOLETINES_URL = "https://portaltramites.inpi.gob.ar/Boletines?Tipo_Item=3"
 CSV_PATH = "Marcas registradas.csv"
 
+# Umbrales
 FUZZY_ALERT = 92
 FUZZY_REVIEW = 88
 
+# “Sirena” manual
 CORE_TERMS_MANUAL = ["TARQUINI"]
 
+# Tokens genéricos para evitar ruido
 GENERIC_TOKENS = {
-    "EL","LA","LOS","LAS","DE","DEL","Y","EN","AL","A",
-    "COLOR","COLORES","NATURAL","MICRO","BASE","PINTURA","REVESTIMIENTO",
-    "SA","S.A","S A","SRL","S.R.L","SOCIEDAD","ANONIMA","ARGENTINA",
-    "INTERIOR","EXTERIOR","BLANCO","NEGRO","GRIS","MATE","SATINADO",
-    "LAVABLE","ACRILICO","LATEX","SELLADOR","FIJADOR","IMPRIMACION"
+    "EL", "LA", "LOS", "LAS", "DE", "DEL", "Y", "EN", "AL", "A",
+    "COLOR", "COLORES", "NATURAL", "MICRO", "BASE", "PINTURA", "REVESTIMIENTO",
+    "SA", "S.A", "S A", "SRL", "S.R.L", "SOCIEDAD", "ANONIMA", "ARGENTINA",
+    "INTERIOR", "EXTERIOR", "BLANCO", "NEGRO", "GRIS", "MATE", "SATINADO",
+    "LAVABLE", "ACRILICO", "LATEX", "SELLADOR", "FIJADOR", "IMPRIMACION"
 }
 
 
@@ -68,8 +71,8 @@ def read_csv_safely(path: str) -> pd.DataFrame:
                 dtype=str,
                 keep_default_na=False,
                 encoding=enc,
-                sep=None,
-                engine="python"
+                sep=None,          # autodetecta , o ;
+                engine="python"    # requerido para sep=None
             )
             print(f"[CSV] OK encoding={enc} cols={len(df.columns)} rows={len(df)}")
             return df
@@ -101,11 +104,14 @@ def fetch_boletin_pdf_links():
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/122.0.0.0 Safari/537.36"
     }
+
     r = requests.get(INPI_BOLETINES_URL, timeout=30, headers=headers)
     r.raise_for_status()
     html = r.text
 
     base = "https://portaltramites.inpi.gob.ar"
+
+    # Extrae todos los href/src
     urls = re.findall(r'''(?:href|src)\s*=\s*["']([^"']+)["']''', html, flags=re.IGNORECASE)
 
     pdf_like = []
@@ -115,6 +121,32 @@ def fetch_boletin_pdf_links():
             pdf_like.append(urljoin(base, u))
 
     return sorted(set(pdf_like)), html
+
+
+def download_bytes(url: str, timeout: int = 60) -> tuple[bytes, str, str]:
+    """
+    Descarga contenido y devuelve (bytes, content_type, final_url)
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/122.0.0.0 Safari/537.36",
+        "Referer": INPI_BOLETINES_URL,
+        "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True)
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    return r.content, ctype, r.url
+
+
+def is_probably_pdf(content: bytes, content_type: str) -> bool:
+    # PDF real suele empezar con %PDF-
+    if content[:5] == b"%PDF-":
+        return True
+    # A veces el server etiqueta PDF aunque no arranque con header (raro, pero pasa)
+    if "pdf" in (content_type or ""):
+        return True
+    return False
 
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -156,20 +188,27 @@ def dedup(rows):
     return out
 
 
+def safe_slug(s: str, max_len: int = 80) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "_", s)
+    return s[-max_len:]
+
+
 def main():
     run_dt = datetime.now(timezone(timedelta(hours=-3)))
     os.makedirs("out", exist_ok=True)
 
+    # 1) Cargar CSV
     _, watch_all = load_watchlist()
     core_terms_auto = build_core_terms_from_watchlist(watch_all, min_len=5)
 
+    # 2) Obtener links + HTML
     pdf_links, boletines_html = fetch_boletin_pdf_links()
 
-    # Guardar HTML SIEMPRE
+    # Guardar HTML SIEMPRE para debug
     with open("out/boletines_page.html", "w", encoding="utf-8") as f:
         f.write(boletines_html)
 
-    # Si no hay PDFs, NO fallar: dejar reporte + html para debug
+    # 3) Si no hay links, no romper: dejar reporte
     if not pdf_links:
         with open("out/reporte_inpi.md", "w", encoding="utf-8") as f:
             f.write("# Reporte INPI – Vigilancia de marcas\n\n")
@@ -180,19 +219,35 @@ def main():
         print("[INPI] No PDFs found. Report + HTML generated.")
         return
 
-    # Por seguridad: revisar últimos 2
+    # 4) Tomar últimos 2 por seguridad
     pdf_links = pdf_links[-2:]
 
     alerts, review, scanned = [], [], []
 
     for link in pdf_links:
-        pdf_bytes = requests.get(link, timeout=60).content
-        text = extract_text_from_pdf(pdf_bytes)
+        content, ctype, final_url = download_bytes(link, timeout=60)
 
-        if len(text.strip()) < 200:
-            scanned.append(link)
+        # Si no es PDF, guardar evidencia y seguir
+        if not is_probably_pdf(content, ctype):
+            name = safe_slug(final_url)
+            with open(f"out/not_pdf_{name}.bin", "wb") as f:
+                f.write(content[:200000])  # hasta 200 KB
+            scanned.append(f"{final_url} (NO PDF; content-type={ctype})")
             continue
 
+        # Intentar extraer texto del PDF; si falla, no romper
+        try:
+            text = extract_text_from_pdf(content)
+        except Exception as e:
+            scanned.append(f"{final_url} (PDF inválido/protegido: {e})")
+            continue
+
+        # Si tiene poco texto, probablemente escaneado
+        if len(text.strip()) < 200:
+            scanned.append(f"{final_url} (PDF sin texto / escaneado)")
+            continue
+
+        # Analizar líneas candidatas
         for raw_line, cand_norm in parse_candidates_from_text(text):
             if contains_core_terms(cand_norm, core_terms_auto):
                 alerts.append({
@@ -201,7 +256,7 @@ def main():
                     "motivo": "Contiene término distintivo (CORE auto)",
                     "score": "",
                     "match_con_nuestra": "CORE",
-                    "fuente": link
+                    "fuente": final_url
                 })
                 continue
 
@@ -213,7 +268,7 @@ def main():
                     "motivo": f"Fuzzy >= {FUZZY_ALERT}",
                     "score": score,
                     "match_con_nuestra": best,
-                    "fuente": link
+                    "fuente": final_url
                 })
             elif FUZZY_REVIEW <= score < FUZZY_ALERT:
                 review.append({
@@ -221,26 +276,27 @@ def main():
                     "motivo": f"Fuzzy {FUZZY_REVIEW}-{FUZZY_ALERT-1}",
                     "score": score,
                     "match_con_nuestra": best,
-                    "fuente": link
+                    "fuente": final_url
                 })
 
     alerts = dedup(alerts)
     review = dedup(review)
 
+    # 5) Reporte final
     with open("out/reporte_inpi.md", "w", encoding="utf-8") as f:
         f.write("# Reporte INPI – Vigilancia de marcas\n\n")
         f.write(f"**Fecha/hora (AR):** {run_dt.strftime('%Y-%m-%d %H:%M')}\n\n")
-        f.write("**Boletines revisados:**\n")
+        f.write("**Boletines/links revisados:**\n")
         for l in pdf_links:
             f.write(f"- {l}\n")
         f.write("\n")
         f.write(f"**CORE auto:** {len(core_terms_auto)} términos (min_len=5)\n\n")
 
         if scanned:
-            f.write("## Atención: PDF sin texto (posible escaneo)\n")
-            for l in scanned:
-                f.write(f"- {l}\n")
-            f.write("\n> Si esto pasa seguido, agregamos OCR.\n\n")
+            f.write("## Observaciones (descargas no-PDF / PDFs inválidos / escaneados)\n\n")
+            for s in scanned:
+                f.write(f"- {s}\n")
+            f.write("\n")
 
         f.write("## Alertas\n\n")
         if alerts:
