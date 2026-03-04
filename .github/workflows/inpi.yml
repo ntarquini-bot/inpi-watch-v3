@@ -1,0 +1,33 @@
+name: INPI Watch
+
+on:
+  schedule:
+    - cron: "15 11 * * *"  # 08:15 Argentina (UTC-3) => 11:15 UTC
+  workflow_dispatch:
+
+jobs:
+  run-watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests rapidfuzz pdfplumber
+
+      - name: Run watcher
+        run: |
+          python watch_inpi.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-inpi
+          path: out/
